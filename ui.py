@@ -100,7 +100,7 @@ def print_banner() -> None:
 
 
 def show_legal_notice_once(config: AppConfig, interactive: bool = True) -> bool:
-    """Display the legal/ethical disclaimer once on first launch.
+    """Display the legal/ethical disclaimer once on first launch for new users.
 
     Returns False only if the user aborts via Ctrl+C/EOF at acknowledgement.
     """
@@ -129,6 +129,36 @@ def print_privilege_error(is_windows: bool) -> None:
     print(f"\n{RED}{t('priv_error_title')}{RESET}")
     hint_key = "priv_error_windows" if is_windows else "priv_error_unix"
     print(f"{YELLOW}{t(hint_key)}{RESET}\n")
+
+
+def print_interfaces_table(
+    interfaces: list[InterfaceInfo], *, include_back_option: bool = False
+) -> None:
+    """Render the formatted table of active network interfaces."""
+    if not interfaces:
+        print(f"\n{RED}{t('ifaces_none')}{RESET}")
+        return
+
+    line = "=" * 74
+    print(f"\n{CYAN}{line}{RESET}")
+    print(f"{CYAN}{t('ifaces_title')}{RESET}")
+    print(f"{CYAN}{line}{RESET}")
+
+    for idx, iface in enumerate(interfaces, start=1):
+        idx_col = fit_column(f"[{idx}]", 5)
+        name_col = fit_column(iface.display_name, 36)
+        ipv4_col = fit_column(iface.ipv4 or "-", 16)
+        ipv6_text = f"  {GRAY}({iface.ipv6}){RESET}" if iface.ipv6 else ""
+        ip_color = GREEN if iface.ipv4 else CYAN
+        print(
+            f"  {YELLOW}{idx_col}{RESET} "
+            f"{BLUE}{name_col}{RESET} "
+            f"{ip_color}{ipv4_col}{RESET}{ipv6_text}"
+        )
+
+    if include_back_option:
+        print(f"  {GRAY}{t('ifaces_back')}{RESET}")
+    print(f"{CYAN}{line}{RESET}")
 
 
 def prompt_main_menu() -> int | None:
@@ -167,25 +197,7 @@ def prompt_interface_menu(interfaces: list[InterfaceInfo]) -> InterfaceInfo | No
         print(f"\n{RED}{t('ifaces_none')}{RESET}")
         return None
 
-    line = "=" * 74
-    print(f"\n{CYAN}{line}{RESET}")
-    print(f"{CYAN}{t('ifaces_title')}{RESET}")
-    print(f"{CYAN}{line}{RESET}")
-
-    for idx, iface in enumerate(interfaces, start=1):
-        idx_col = fit_column(f"[{idx}]", 5)
-        name_col = fit_column(iface.display_name, 36)
-        ipv4_col = fit_column(iface.ipv4 or "-", 16)
-        ipv6_text = f"  {GRAY}({iface.ipv6}){RESET}" if iface.ipv6 else ""
-        ip_color = GREEN if iface.ipv4 else CYAN
-        print(
-            f"  {YELLOW}{idx_col}{RESET} "
-            f"{BLUE}{name_col}{RESET} "
-            f"{ip_color}{ipv4_col}{RESET}{ipv6_text}"
-        )
-
-    print(f"  {GRAY}{t('ifaces_back')}{RESET}")
-    print(f"{CYAN}{line}{RESET}")
+    print_interfaces_table(interfaces, include_back_option=True)
 
     while True:
         raw = safe_input(t("ifaces_prompt", count=len(interfaces)), color=BLUE)
@@ -294,7 +306,11 @@ def run_settings_menu(settings: CaptureSettings, config: AppConfig) -> None:
                     settings.log_path = None
                 else:
                     path = Path(cleaned)
-                    if path.suffix.lower() not in {".csv", ".json"}:
+                    ext = path.suffix.lower()
+                    if ext == ".json":
+                        path = path.with_suffix(".jsonl")
+                        print(f"{YELLOW}{t('log_ext_adjusted', path=path)}{RESET}")
+                    elif ext not in {".csv", ".jsonl"}:
                         path = path.with_suffix(".csv")
                         print(f"{YELLOW}{t('log_ext_adjusted', path=path)}{RESET}")
                     settings.log_path = path
@@ -313,7 +329,7 @@ def run_settings_menu(settings: CaptureSettings, config: AppConfig) -> None:
 
 
 def run_language_menu(config: AppConfig) -> None:
-    """Interactive menu to switch UI language and persist in config.json."""
+    """Interactive menu to switch UI language and persist in user config dir."""
     codes = list(SUPPORTED_LANGUAGES.keys())
     line = "=" * 50
     print(f"\n{CYAN}{line}{RESET}")
@@ -364,11 +380,18 @@ def _proto_color(protocol: str) -> str:
     upper = protocol.upper()
     if upper in {"TCP", "TLS"}:
         return GREEN
-    if upper in {"UDP", "DNS"}:
+    if upper in {"UDP", "DNS", "QUIC"}:
         return CYAN
     if upper in {"ICMP", "ICMPV6", "ARP"}:
         return YELLOW
     return BLUE
+
+
+def _style_host_column(padded_col: str) -> str:
+    """Highlight leading '~' unauthenticated marker in GRAY without altering width."""
+    if padded_col.startswith("~"):
+        return f"{GRAY}~{RESET}{padded_col[1:]}"
+    return padded_col
 
 
 def format_packet_line(record: PacketRecord) -> str:
@@ -376,8 +399,8 @@ def format_packet_line(record: PacketRecord) -> str:
     ts_col = fit_column(record.timestamp_short, 8)
     proto_col = fit_column(record.protocol, 6)
     size_col = fit_column(f"{record.length}B", 7, align="right")
-    src_col = fit_column(record.src_display, 26)
-    dst_col = fit_column(record.dst_display, 26)
+    src_col = _style_host_column(fit_column(record.src_display, 26))
+    dst_col = _style_host_column(fit_column(record.dst_display, 26))
 
     p_color = _proto_color(record.protocol)
     details_part = f" {GRAY}|{RESET} {record.info}" if record.info else ""
@@ -392,13 +415,15 @@ def format_packet_line(record: PacketRecord) -> str:
 
 
 def print_capture_summary(stats: CaptureStats, resolver_stats: str) -> None:
-    """Print end-of-capture traffic statistics, top destinations, and cache metrics."""
+    """Print end-of-capture traffic statistics, dropped count, top hosts, and cache metrics."""
     line = "=" * 74
     print(f"\n{CYAN}{line}{RESET}")
     print(f"{CYAN}{t('summary_title')}{RESET}")
     print(f"{CYAN}{line}{RESET}")
     print(f"  {BLUE}{t('summary_duration', seconds=stats.duration_seconds)}{RESET}")
     print(f"  {BLUE}{t('summary_packets', packets=stats.total_packets)}{RESET}")
+    drop_color = RED if stats.dropped_packets > 0 else BLUE
+    print(f"  {drop_color}{t('summary_dropped', dropped=stats.dropped_packets)}{RESET}")
     print(
         f"  {BLUE}"
         f"{t('summary_bytes', bytes_human=format_bytes(stats.total_bytes), bytes_raw=f'{stats.total_bytes:,}')}"

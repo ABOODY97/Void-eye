@@ -2,3 +2,4 @@ scapy==2.8.0
 arabic-reshaper==3.1.0
 python-bidi==0.6.12
 colorama==0.4.6
+cryptography==50.0.2

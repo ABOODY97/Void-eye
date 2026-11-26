@@ -1,8 +1,9 @@
-"""IP-to-service/domain resolver with CIDR matching, PSL handling, and async rDNS."""
+"""IP-to-service/domain resolver with spoofing defenses, source priority, and timeout rDNS."""
 
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 import ipaddress
 import json
@@ -12,12 +13,32 @@ import queue
 import socket
 import threading
 import time
+from typing import Any, Literal
+import unicodedata
 
 from i18n import t
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "known_ips.json"
+
+SourceTag = Literal["known", "sni", "dns", "rdns", "cidr", "special", "raw"]
+
+# Source priority hierarchy: SNI > DNS > rDNS > CIDR (Known exact IP is highest).
+SOURCE_PRIORITY: dict[str, int] = {
+    "raw": 0,
+    "cidr": 10,
+    "rdns": 20,
+    "dns": 30,
+    "sni": 40,
+    "known": 50,
+    "special": 50,
+}
+
+# Names learned passively from network packets or untrusted PTR records.
+UNAUTHENTICATED_SOURCES: frozenset[str] = frozenset({"sni", "dns", "rdns"})
+
+CSV_DANGEROUS_PREFIXES: tuple[str, ...] = ("=", "+", "-", "@")
 
 # Common multi-part public suffixes so e.g. sub.bbc.co.uk -> bbc.co.uk
 # and portal.haber.com.tr -> haber.com.tr without external HTTP calls.
@@ -256,13 +277,73 @@ MULTI_PART_PUBLIC_SUFFIXES: frozenset[str] = frozenset(
 )
 
 
+def sanitize_network_text(
+    value: str | bytes | None,
+    max_len: int = 253,
+) -> str:
+    """Neutralize terminal escape/control characters in untrusted packet strings.
+
+    Replaces every non-printable ASCII/Unicode control or format character
+    (including ESC \\x1b, BEL, CR/LF, C1 controls, and BiDi overrides) with '?'
+    and caps length to *max_len* (RFC 1035 domain limit = 253).
+    """
+    if value is None or max_len <= 0:
+        return ""
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = str(value)
+
+    sanitized_chars: list[str] = []
+    for ch in text:
+        if len(sanitized_chars) >= max_len:
+            break
+        if not ch.isprintable() or unicodedata.category(ch).startswith("C"):
+            sanitized_chars.append("?")
+        else:
+            sanitized_chars.append(ch)
+    return "".join(sanitized_chars)
+
+
+def sanitize_csv_field(value: Any) -> Any:
+    """Prevent spreadsheet formula injection when exporting strings to CSV."""
+    if not isinstance(value, str) or not value:
+        return value
+    if value.startswith(CSV_DANGEROUS_PREFIXES):
+        return f"'{value}"
+    return value
+
+
+@dataclass(frozen=True)
+class ResolvedHost:
+    """Detailed resolution result carrying provenance and shared-IP history."""
+
+    name: str
+    source: SourceTag
+    recent_names: tuple[str, ...] = ()
+
+    @property
+    def is_authenticated(self) -> bool:
+        """Return False for names learned passively from network traffic or PTRs."""
+        return self.source not in UNAUTHENTICATED_SOURCES
+
+    @property
+    def display_name(self) -> str:
+        """Return *name* prefixed with '~' when derived from unauthenticated sources."""
+        if not self.is_authenticated and self.name:
+            return f"~{self.name}"
+        return self.name
+
+
 @dataclass(frozen=True)
 class CacheEntry:
     """Single TTL-bounded entry inside the resolver LRU cache."""
 
     value: str
+    source: SourceTag
     expires_at: float
     is_negative: bool = False
+    recent_names: tuple[tuple[str, SourceTag], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -372,7 +453,7 @@ def load_known_database(path: Path | None = None) -> KnownDatabase:
 
 def extract_registered_domain(hostname: str) -> str:
     """Extract the registrable domain (e.g. 'a.b.bbc.co.uk' -> 'bbc.co.uk')."""
-    normalized = hostname.strip().rstrip(".").lower()
+    normalized = sanitize_network_text(hostname).strip().rstrip(".").lower()
     if not normalized:
         return ""
 
@@ -397,16 +478,11 @@ def clean_hostname(
     exact_domains: dict[str, str] | None = None,
     label_keywords: dict[str, str] | None = None,
 ) -> str:
-    """Map a hostname to a known service name or its clean registered domain.
-
-    Matches only complete domain suffixes (for dotted keys such as 'live.com',
-    'redd.it', 'zoom.us') or the exact registrable SLD label (for single-label
-    keys such as 'google', 'github', 'snapchat'), preventing substring false
-    positives like 'deliver.com' -> 'live' or 'zoominfo.com' -> 'zoom'.
-    """
-    normalized = hostname.strip().rstrip(".").lower()
+    """Map a hostname to a known service name or its clean registered domain."""
+    sanitized = sanitize_network_text(hostname)
+    normalized = sanitized.strip().rstrip(".").lower()
     if not normalized:
-        return hostname
+        return sanitized
 
     reg_domain = extract_registered_domain(normalized)
 
@@ -429,15 +505,15 @@ _LAN_IPV4_NETS: tuple[ipaddress.IPv4Network, ...] = (
     ipaddress.IPv4Network("10.0.0.0/8"),
     ipaddress.IPv4Network("172.16.0.0/12"),
     ipaddress.IPv4Network("192.168.0.0/16"),
-    ipaddress.IPv4Network("100.64.0.0/10"),
 )
+_CGNAT_IPV4_NET = ipaddress.IPv4Network("100.64.0.0/10")
 _LAN_IPV6_NET = ipaddress.IPv6Network("fc00::/7")
 
 
 def classify_special_ip(
     addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
 ) -> str | None:
-    """Return a translated category key for non-global IPs, or None if global."""
+    """Return a translated category label for non-global IPs, or None if global."""
     if addr == ipaddress.IPv4Address("255.255.255.255"):
         return t("ip_broadcast")
     if addr.is_loopback:
@@ -447,6 +523,8 @@ def classify_special_ip(
     if addr.is_multicast:
         return t("ip_multicast")
     if isinstance(addr, ipaddress.IPv4Address):
+        if addr in _CGNAT_IPV4_NET:
+            return t("ip_cgnat")
         if any(addr in net for net in _LAN_IPV4_NETS):
             return t("ip_lan")
     elif addr in _LAN_IPV6_NET:
@@ -463,8 +541,76 @@ def format_special_ip(ip_text: str, category_label: str) -> str:
     return f"{ip_text} ({category_label})"
 
 
+class _DaemonCallPool:
+    """Daemon-thread call executor returning Futures so timed-out rDNS cannot stall workers."""
+
+    def __init__(self, max_workers: int = 8) -> None:
+        self._queue: queue.Queue[tuple[Future[str], str] | None] = queue.Queue()
+        self._workers: list[threading.Thread] = []
+        self._started = False
+        self._closed = False
+        self._max_workers = max(1, max_workers)
+        self._lock = threading.Lock()
+
+    def _ensure_started(self) -> None:
+        if self._started or self._closed:
+            return
+        with self._lock:
+            if self._started or self._closed:
+                return
+            for idx in range(self._max_workers):
+                t_worker = threading.Thread(
+                    target=self._loop,
+                    name=f"void-eye-ptr-{idx}",
+                    daemon=True,
+                )
+                t_worker.start()
+                self._workers.append(t_worker)
+            self._started = True
+
+    def _loop(self) -> None:
+        while not self._closed:
+            item = self._queue.get()
+            if item is None:
+                self._queue.task_done()
+                break
+            fut, ip_str = item
+            if not fut.set_running_or_notify_cancel():
+                self._queue.task_done()
+                continue
+            try:
+                hostname, _, _ = socket.gethostbyaddr(ip_str)
+                fut.set_result(hostname)
+            except BaseException as exc:
+                fut.set_exception(exc)
+            finally:
+                self._queue.task_done()
+
+    def submit_rdns(self, ip_str: str) -> Future[str]:
+        """Submit a blocking gethostbyaddr call and return its Future."""
+        self._ensure_started()
+        fut: Future[str] = Future()
+        if self._closed:
+            fut.cancel()
+            return fut
+        self._queue.put((fut, ip_str))
+        return fut
+
+    def shutdown(self) -> None:
+        self._closed = True
+        if self._started:
+            for _ in self._workers:
+                try:
+                    self._queue.put_nowait(None)
+                except queue.Full:
+                    break
+
+
+DnsQueryKey = tuple[str, str, int, str]  # (client_ip, server_ip, txid, qname)
+
+
 class Resolver:
-    """Thread-safe IP resolver with CIDR lookup, bounded TTL/LRU cache, and async rDNS."""
+    """Thread-safe IP resolver with anti-spoofing, source priority, and bounded rDNS."""
 
     def __init__(
         self,
@@ -473,18 +619,27 @@ class Resolver:
         ttl_seconds: float = 600.0,
         negative_ttl_seconds: float = 120.0,
         rdns_workers: int = 4,
+        rdns_timeout: float = 2.0,
         max_pending: int = 256,
+        max_recent_names: int = 5,
+        dns_query_ttl: float = 10.0,
+        max_pending_dns_queries: int = 4096,
         enable_async_rdns: bool = True,
     ) -> None:
         self._db = load_known_database(db_path)
         self._max_cache_size = max(16, max_cache_size)
         self._ttl_seconds = ttl_seconds
         self._negative_ttl_seconds = negative_ttl_seconds
+        self._rdns_timeout = max(0.05, rdns_timeout)
+        self._max_recent_names = max(1, max_recent_names)
+        self._dns_query_ttl = max(0.5, dns_query_ttl)
+        self._max_pending_dns_queries = max(32, max_pending_dns_queries)
         self._enable_async_rdns = enable_async_rdns
 
         self._lock = threading.Lock()
         self._cache: OrderedDict[str, CacheEntry] = OrderedDict()
         self._pending: dict[str, threading.Event] = {}
+        self._pending_dns: OrderedDict[DnsQueryKey, float] = OrderedDict()
         self._hits = 0
         self._misses = 0
 
@@ -492,11 +647,12 @@ class Resolver:
         self._queue: queue.Queue[tuple[str, threading.Event] | None] = queue.Queue(
             maxsize=max(16, max_pending)
         )
+        self._ptr_pool = _DaemonCallPool(max_workers=max(4, self._rdns_workers * 2))
         self._workers_started = False
         self._closed = False
 
     def _ensure_workers(self) -> None:
-        """Lazily start daemon reverse-DNS worker threads on first needed lookup."""
+        """Lazily start daemon coordinator threads on first needed lookup."""
         if self._workers_started or self._closed or not self._enable_async_rdns:
             return
         with self._lock:
@@ -512,7 +668,7 @@ class Resolver:
             self._workers_started = True
 
     def _rdns_worker_loop(self) -> None:
-        """Background daemon worker executing blocking gethostbyaddr calls."""
+        """Coordinator worker enforcing Future timeout on each PTR lookup."""
         while not self._closed:
             item = self._queue.get()
             if item is None:
@@ -528,13 +684,26 @@ class Resolver:
                 self._queue.task_done()
 
     def _perform_rdns(self, ip_str: str) -> None:
-        """Execute reverse DNS and store positive or negative result in cache."""
+        """Execute timeout-bounded reverse DNS and record positive or negative cache."""
+        fut = self._ptr_pool.submit_rdns(ip_str)
         try:
-            hostname, _, _ = socket.gethostbyaddr(ip_str)
-            cleaned = self.clean_domain(hostname)
-            self._store_cache(ip_str, cleaned, is_negative=False)
-        except (socket.herror, socket.gaierror, TimeoutError, OSError, UnicodeError):
-            self._store_cache(ip_str, ip_str, is_negative=True)
+            raw_host = fut.result(timeout=self._rdns_timeout)
+            sanitized = sanitize_network_text(raw_host)
+            cleaned = self.clean_domain(sanitized)
+            if cleaned:
+                self._store_cache(ip_str, cleaned, source="rdns", is_negative=False)
+            else:
+                self._store_cache(ip_str, ip_str, source="raw", is_negative=True)
+        except (
+            FutureTimeoutError,
+            socket.herror,
+            socket.gaierror,
+            TimeoutError,
+            OSError,
+            UnicodeError,
+        ):
+            fut.cancel()
+            self._store_cache(ip_str, ip_str, source="raw", is_negative=True)
 
     def _get_cached(self, ip_str: str) -> CacheEntry | None:
         """Fetch an unexpired entry from the LRU cache, evicting if expired."""
@@ -550,16 +719,68 @@ class Resolver:
             self._hits += 1
             return entry
 
-    def _store_cache(self, ip_str: str, value: str, *, is_negative: bool) -> None:
-        """Insert or update an entry in the bounded LRU cache."""
+    def _store_cache(
+        self,
+        ip_str: str,
+        value: str,
+        *,
+        source: SourceTag,
+        is_negative: bool,
+    ) -> None:
+        """Insert or update an entry while enforcing SNI > DNS > rDNS > CIDR priority."""
+        now = time.monotonic()
         ttl = self._negative_ttl_seconds if is_negative else self._ttl_seconds
-        expires_at = time.monotonic() + ttl
+        expires_at = now + ttl
+
         with self._lock:
-            self._cache[ip_str] = CacheEntry(
-                value=value,
-                expires_at=expires_at,
-                is_negative=is_negative,
-            )
+            existing = self._cache.get(ip_str)
+            if existing is not None and now < existing.expires_at and not existing.is_negative:
+                if is_negative:
+                    # Never overwrite a valid positive entry with a negative rDNS failure.
+                    return
+
+                # Update bounded per-IP history of recent names.
+                history = [
+                    item
+                    for item in existing.recent_names
+                    if item != (value, source)
+                ]
+                history.append((value, source))
+                if len(history) > self._max_recent_names:
+                    history = history[-self._max_recent_names :]
+
+                new_rank = SOURCE_PRIORITY.get(source, 0)
+                cur_rank = SOURCE_PRIORITY.get(existing.source, 0)
+
+                if new_rank >= cur_rank:
+                    # Upgrade or refresh with newer equal/higher-priority name (e.g. latest SNI).
+                    chosen_val = value
+                    chosen_src = source
+                else:
+                    # Preserve higher-priority source (e.g. never overwrite SNI with DNS/rDNS).
+                    chosen_val = existing.value
+                    chosen_src = existing.source
+                    expires_at = max(existing.expires_at, expires_at)
+
+                self._cache[ip_str] = CacheEntry(
+                    value=chosen_val,
+                    source=chosen_src,
+                    expires_at=expires_at,
+                    is_negative=False,
+                    recent_names=tuple(history),
+                )
+            else:
+                initial_history: tuple[tuple[str, SourceTag], ...] = (
+                    () if is_negative else ((value, source),)
+                )
+                self._cache[ip_str] = CacheEntry(
+                    value=value,
+                    source=source,
+                    expires_at=expires_at,
+                    is_negative=is_negative,
+                    recent_names=initial_history,
+                )
+
             self._cache.move_to_end(ip_str)
             while len(self._cache) > self._max_cache_size:
                 self._cache.popitem(last=False)
@@ -572,19 +793,95 @@ class Resolver:
             label_keywords=self._db.label_keywords,
         )
 
-    def learn_dns_mapping(self, ip_str: str, hostname: str) -> None:
-        """Passively cache an IP -> domain mapping observed in DNS/SNI traffic."""
+    @staticmethod
+    def _normalize_ip_or_empty(ip_str: str) -> str:
         try:
-            normalized_ip = str(ipaddress.ip_address(ip_str.strip()))
+            return str(ipaddress.ip_address(ip_str.strip()))
         except ValueError:
+            return ""
+
+    def record_dns_query(
+        self,
+        client_ip: str,
+        server_ip: str,
+        txid: int,
+        qname: str,
+    ) -> None:
+        """Record an outbound DNS query so matching responses can be authenticated."""
+        c_ip = self._normalize_ip_or_empty(client_ip)
+        s_ip = self._normalize_ip_or_empty(server_ip)
+        clean_qname = sanitize_network_text(qname).strip().rstrip(".").lower()
+        if not c_ip or not s_ip or not clean_qname:
             return
-        cleaned_host = hostname.strip().rstrip(".").lower()
-        if not cleaned_host:
+
+        now = time.monotonic()
+        key: DnsQueryKey = (c_ip, s_ip, int(txid) & 0xFFFF, clean_qname)
+        with self._lock:
+            # Opportunistically prune expired entries from the front of the FIFO.
+            while self._pending_dns:
+                oldest_key, oldest_exp = next(iter(self._pending_dns.items()))
+                if now >= oldest_exp:
+                    self._pending_dns.popitem(last=False)
+                else:
+                    break
+            self._pending_dns[key] = now + self._dns_query_ttl
+            self._pending_dns.move_to_end(key)
+            while len(self._pending_dns) > self._max_pending_dns_queries:
+                self._pending_dns.popitem(last=False)
+
+    def learn_dns_response(
+        self,
+        client_ip: str,
+        server_ip: str,
+        txid: int,
+        qname: str,
+        mappings: list[tuple[str, str]],
+    ) -> bool:
+        """Learn A/AAAA mappings ONLY if matching a recent outbound query."""
+        if not mappings:
+            return False
+        c_ip = self._normalize_ip_or_empty(client_ip)
+        s_ip = self._normalize_ip_or_empty(server_ip)
+        clean_qname = sanitize_network_text(qname).strip().rstrip(".").lower()
+        if not c_ip or not s_ip or not clean_qname:
+            return False
+
+        now = time.monotonic()
+        key: DnsQueryKey = (c_ip, s_ip, int(txid) & 0xFFFF, clean_qname)
+        with self._lock:
+            expires_at = self._pending_dns.pop(key, None)
+            if expires_at is None or now >= expires_at:
+                return False
+
+        learned_any = False
+        for mapped_ip, mapped_domain in mappings:
+            norm_ip = self._normalize_ip_or_empty(mapped_ip)
+            if not norm_ip:
+                continue
+            addr = ipaddress.ip_address(norm_ip)
+            if classify_special_ip(addr) is not None or norm_ip in self._db.known_ips:
+                continue
+            sanitized_dom = sanitize_network_text(mapped_domain).strip().rstrip(".").lower()
+            if not sanitized_dom:
+                continue
+            display = self.clean_domain(sanitized_dom)
+            if display:
+                self._store_cache(norm_ip, display, source="dns", is_negative=False)
+                learned_any = True
+        return learned_any
+
+    def learn_sni(self, ip_str: str, server_name: str) -> None:
+        """Record an SNI hostname observed on a TLS/QUIC ClientHello to *ip_str*."""
+        norm_ip = self._normalize_ip_or_empty(ip_str)
+        if not norm_ip:
             return
-        # Store the friendly brand or clean registered domain in cache so
-        # CDN IPs resolve to the actual visited service instead of generic CDN CIDR.
-        display = self.clean_domain(cleaned_host)
-        self._store_cache(normalized_ip, display, is_negative=False)
+        addr = ipaddress.ip_address(norm_ip)
+        if classify_special_ip(addr) is not None or norm_ip in self._db.known_ips:
+            return
+        sanitized = sanitize_network_text(server_name).strip().rstrip(".").lower()
+        if not sanitized:
+            return
+        self._store_cache(norm_ip, sanitized, source="sni", is_negative=False)
 
     def _match_cidr(
         self, addr: ipaddress.IPv4Address | ipaddress.IPv6Address
@@ -600,22 +897,18 @@ class Resolver:
                     return label
         return None
 
-    def resolve(self, ip_str: str, wait_timeout: float = 0.0) -> str:
-        """Resolve *ip_str* without blocking packet capture.
+    def resolve_detailed(
+        self, ip_str: str, wait_timeout: float = 0.0
+    ) -> ResolvedHost:
+        """Resolve *ip_str* and return name, provenance source tag, and recent history.
 
-        Resolution priority:
-        1. Exact Known IPs (e.g. 8.8.8.8 -> Google DNS)
-        2. Non-global Special IPs (Loopback / LAN / Link-Local / Multicast) - never rDNS
-        3. Bounded LRU+TTL Cache (includes passive DNS/SNI mappings & negative cache)
-        4. Known CIDR Ranges (IPv4 & IPv6, most specific prefix first)
-        5. Asynchronous Reverse DNS (returns raw IP immediately until ready, unless
-           *wait_timeout* > 0 is explicitly requested)
+        Priority: Known IP > Special IP > Cache (SNI > DNS > rDNS) > CIDR > Async rDNS.
         """
-        raw = ip_str.strip()
+        raw = sanitize_network_text(ip_str, max_len=64).strip()
         try:
             addr = ipaddress.ip_address(raw)
         except ValueError:
-            return raw
+            return ResolvedHost(name=raw, source="raw")
 
         normalized = str(addr)
 
@@ -623,17 +916,22 @@ class Resolver:
         if normalized in self._db.known_ips:
             with self._lock:
                 self._hits += 1
-            return self._db.known_ips[normalized]
+            return ResolvedHost(name=self._db.known_ips[normalized], source="known")
 
-        # 2. Private / Loopback / Link-Local / Multicast / Reserved (skip rDNS!)
+        # 2. Private / CGNAT / Loopback / Link-Local / Multicast / Reserved (never rDNS)
         special_label = classify_special_ip(addr)
         if special_label is not None:
-            return format_special_ip(normalized, special_label)
+            return ResolvedHost(
+                name=format_special_ip(normalized, special_label),
+                source="special",
+            )
 
-        # 3. Cache (positive & negative entries, plus passive DNS/SNI mappings)
+        # 3. Cache (SNI > DNS > rDNS > CIDR & negative cache)
         cached = self._get_cached(normalized)
         if cached is not None:
-            return cached.value
+            recent = tuple(name for name, _ in cached.recent_names)
+            src: SourceTag = "raw" if cached.is_negative else cached.source
+            return ResolvedHost(name=cached.value, source=src, recent_names=recent)
 
         with self._lock:
             self._misses += 1
@@ -641,12 +939,16 @@ class Resolver:
         # 4. Known CIDR Ranges
         cidr_match = self._match_cidr(addr)
         if cidr_match is not None:
-            self._store_cache(normalized, cidr_match, is_negative=False)
-            return cidr_match
+            self._store_cache(normalized, cidr_match, source="cidr", is_negative=False)
+            return ResolvedHost(
+                name=cidr_match,
+                source="cidr",
+                recent_names=(cidr_match,),
+            )
 
         # 5. Asynchronous Reverse DNS
         if not self._enable_async_rdns or self._closed:
-            return normalized
+            return ResolvedHost(name=normalized, source="raw")
 
         self._ensure_workers()
         done_event: threading.Event | None = None
@@ -673,9 +975,15 @@ class Resolver:
             if done_event.wait(timeout=wait_timeout):
                 ready = self._get_cached(normalized)
                 if ready is not None:
-                    return ready.value
+                    recent = tuple(name for name, _ in ready.recent_names)
+                    src = "raw" if ready.is_negative else ready.source
+                    return ResolvedHost(name=ready.value, source=src, recent_names=recent)
 
-        return normalized
+        return ResolvedHost(name=normalized, source="raw")
+
+    def resolve(self, ip_str: str, wait_timeout: float = 0.0) -> str:
+        """Resolve *ip_str* to a clean host/label string without blocking capture."""
+        return self.resolve_detailed(ip_str, wait_timeout=wait_timeout).name
 
     def metrics(self) -> CacheMetrics:
         """Return a thread-safe snapshot of cache metrics."""
@@ -710,6 +1018,7 @@ class Resolver:
     def shutdown(self) -> None:
         """Signal background rDNS threads to stop without blocking exit."""
         self._closed = True
+        self._ptr_pool.shutdown()
         if self._workers_started:
             for _ in range(self._rdns_workers):
                 try:
@@ -735,11 +1044,6 @@ def get_resolver() -> Resolver:
 def resolve(ip_str: str, wait_timeout: float = 0.0) -> str:
     """Resolve *ip_str* using the default Resolver instance."""
     return get_resolver().resolve(ip_str, wait_timeout=wait_timeout)
-
-
-def learn_dns_mapping(ip_str: str, hostname: str) -> None:
-    """Record a passive DNS or SNI hostname mapping in the default Resolver."""
-    get_resolver().learn_dns_mapping(ip_str, hostname)
 
 
 def cache_stats() -> str:

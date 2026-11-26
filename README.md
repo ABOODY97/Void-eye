@@ -17,47 +17,49 @@
 # أداة VOID EYE (Mini Wireshark)
 
 ## نبذة عن الأداة
-أداة **VOID EYE** هي أداة خفيفة وتفاعلية لمراقبة وتحليل حزم الشبكة (Packet Sniffer) عبر الطرفية (Terminal) مبنية بلغة **Python 3.10+** ومكتبة **Scapy**. تقوم الأداة بالتقاط الحزم الحية (`IPv4`، `IPv6`، `ARP`، `TCP`، `UDP`، `ICMP`، `DNS`، `TLS`) وعرض المصدر والوجهة بوضوح مع التعرف الذكي وغير المتزامن على أسماء النطاقات والخدمات.
+أداة **VOID EYE** هي أداة خفيفة وآمنة لمراقبة وتحليل حزم الشبكة (Packet Sniffer) عبر الطرفية مبنية بلغة **Python 3.10+** ومكتبة **Scapy**. تلتقط الأداة الحزم الحية (`IPv4`، `IPv6`، `ARP`، `TCP`، `UDP`، `ICMP`، `DNS`، `TLS`، `QUIC`) عبر طابور غير حاجب (Non-blocking Queue) مع استخراج آمن لأسماء النطاقات وحماية ضد حقن الطرفية وتزوير DNS.
 
 ## أبرز المميزات
-* **متعددة اللغات (i18n):** تدعم الإنجليزية (الافتراضية)، العربية (مع معالجة الحروف والاتجاه عبر `arabic-reshaper` و`python-bidi` وخيار `--no-bidi` للطرفيات الحديثة)، والتركية، مع حفظ اللغة تلقائياً في `config.json`.
-* **استخراج أسماء النطاقات الحقيقية:** قراءة استعلامات `DNS (qname)` وامتداد `TLS SNI (server_name)` وتفضيلها على تخمين عناوين الـ IP، مع التعلّم السلبي من ردود DNS.
-* **نظام Resolver غير متزامن ودقيق:**
-  * مطابقة نطاقات الشبكة بصيغة `CIDR` عبر مكتبة `ipaddress` لكل من `IPv4` و`IPv6`.
-  * استعلامات `Reverse DNS` في الخلفية بدون تجميد التقاط الحزم، مع ذاكرة مؤقتة محدودة الحجم والزمن (`LRU + TTL` و`Negative Caching`).
-  * استثناء العناوين الخاصة والمحلية (`LAN` / `Localhost` / `Link-Local`) من استعلامات DNS العكسية.
-  * دعم اللواحق العامة متعددة الأجزاء مثل `co.uk` و`com.tr` و`com.sa` ومنع التطابق الخاطئ للكلمات الجزئية.
-* **فلاتر وتصدير احترافي:** دعم فلاتر `BPF` وفلاتر البروتوكولات وحفظ الجلسات بصيغ `.pcap` و`.csv` و`.json`، مع ملخص إحصائي شامل عند انتهاء الالتقاط.
+* **الأمان والموثوقية:**
+  * تعقيم كامل للنصوص القادمة من الشبكة (`sanitize_network_text`) لمنع حقن أكواد ANSI/التحكم في الطرفية، وحماية ملفات `CSV` من حقن المعادلات (`= + - @`).
+  * مقاومة تزوير الـ DNS: لا يتم تعلّم عناوين `A/AAAA` إلا عند مطابقة استعلام صادر سابق (نفس العميل، الخادم، معرّف العملية `TXID`، واسم النطاق)، مع تمييز الأسماء المتعلَّمة من الشبكة بالبادئة `~` وترتيب الأولوية `SNI > DNS > rDNS > CIDR`.
+  * منع تذبذب أسماء النطاقات على عناوين الـ CDN المشتركة مع الاحتفاظ بآخر اسم مستخرج من `SNI`.
+* **بروتوكولات حديثة وأداء عالٍ:**
+  * إعادة تجميع رسائل `TLS ClientHello` المقسمة على عدة مقاطع `TCP`، وفك تشفير حزم `QUIC Initial` (`UDP 443`) لاستخراج `SNI`.
+  * طابور التقاط غير حاجب مع إحصاء الحزم المفقودة (`Dropped Packets`)، وطوابع زمنية دقيقة من `packet.time`، وتفريغ دوري لملفات `.pcap` وسجلات `.jsonl` و`.csv`.
+  * تمييز عناوين `100.64.0.0/10` كـ `CGNAT` بشكل مستقل عن `LAN`، وأداة اختيارية `tools/update_ranges.py` لتحديث نطاقات `CIDR` من المصادر الرسمية.
+* **متعددة اللغات وتخزين نظيف للإعدادات:**
+  * دعم الإنجليزية (الافتراضية)، العربية (`--no-bidi` للطرفيات الحديثة)، والتركية، مع حفظ الإعدادات في مجلد المستخدم (`%APPDATA%\void_eye` على Windows أو `~/.config/void_eye` على Linux/macOS).
 
 ## المتطلبات والتثبيت
 1. **Python 3.10** أو أحدث.
-2. **لمستخدمي Windows:** يجب تثبيت برنامج **[Npcap](https://npcap.com/)** (مع تفعيل خيار *Install Npcap in WinPcap API-compatible Mode*)، وتشغيل الطرفية (`PowerShell` أو `CMD`) بصلاحيات **المسؤول (Run as Administrator)**.
-3. **لمستخدمي Linux / macOS:** يتطلب التشغيل صلاحيات الجذر (`sudo`) ومكتبة `libpcap`.
+2. **Windows:** تثبيت **[Npcap](https://npcap.com/)** (تفعيل *WinPcap API-compatible Mode*) وتشغيل الطرفية بصلاحيات **المسؤول (Administrator)**.
+3. **Linux / macOS:** التشغيل بصلاحيات `sudo` مع وجود `libpcap`.
 
-تثبيت الحزم:
 ```bash
+pip install -e ".[dev]"
+# أو لتثبيت الاعتماديات فقط:
 pip install -r requirements.txt
 ```
 
 ## طريقة التشغيل
-التشغيل التفاعلي (القائمة الرئيسية):
 ```bash
-# Linux / macOS
-sudo python3 void_eye.py
+# عرض الواجهات المتاحة بدون الحاجة لبدء الالتقاط
+void-eye --list-interfaces
 
-# Windows (داخل PowerShell كمسؤول Administrator)
-python void_eye.py
-```
+# التشغيل التفاعلي
+sudo void-eye                     # Linux / macOS
+void-eye                          # Windows (Administrator)
 
-التشغيل عبر سطر الأوامر (CLI):
-```bash
-python void_eye.py --lang ar
-python void_eye.py --iface "Wi-Fi" --filter "tcp port 443" --save capture.pcap --save traffic.csv
-python void_eye.py --lang ar --no-bidi
+# التقاط محدد بعدد حزم أو مدة زمنية وحفظ بصيغة PCAP و JSONL
+void-eye --iface "Wi-Fi" --filter "port 443 or port 53" --max-packets 200 --duration 30 --save capture.pcap --save traffic.jsonl
+
+# تحديث نطاقات CIDR اختيارياً (آمن عند انقطاع الإنترنت)
+python tools/update_ranges.py
 ```
 
 ## إخلاء المسؤولية القانونية والأخلاقية
-> **تنويه هام:** صُممت هذه الأداة للأغراض التعليمية وتشخيص الشبكات المصرح بها فقط. يُحظر استخدامها لاعتراض حركة البيانات على شبكات لا تملكها أو لا تملك تصريحاً صريحاً ومكتوباً بفحصها.
+> **تنويه هام:** صُممت هذه الأداة للأغراض التعليمية وتشخيص الشبكات المصرح بها فقط. يُحظر استخدامها لاعتراض حركة البيانات على شبكات لا تملكها أو لا تملك تصريحاً صريحاً بفحصها.
 
 </div>
 
@@ -65,43 +67,28 @@ python void_eye.py --lang ar --no-bidi
 
 ## English Overview
 
-**VOID EYE (Mini Wireshark)** is a cross-platform terminal packet sniffer written in **Python 3.10+** on top of **Scapy**. It captures `IPv4`, `IPv6`, and `ARP` traffic in real time, extracts `DNS` query names and `TLS ClientHello SNI` hostnames, resolves public IPs asynchronously without stalling capture callbacks, and exports sessions to `.pcap`, `.csv`, and `.json`.
+**VOID EYE (Mini Wireshark)** is a hardened cross-platform terminal packet sniffer built with **Python 3.10+** and **Scapy**.
 
-### Prerequisites & Usage
-- **Python 3.10+**
-- **Windows:** Install **[Npcap](https://npcap.com/)** (enable *WinPcap API-compatible mode*) and run PowerShell / Command Prompt **as Administrator**.
-- **Linux / macOS:** Run with `sudo` (`libpcap` required).
+### Key Highlights
+- **Security Hardening:** Neutralizes terminal escape/control sequences (`sanitize_network_text`), prevents CSV formula injection, validates DNS answers against pending outbound queries `(client, server, txid, qname)` to block unsolicited cache poisoning, enforces `SNI > DNS > rDNS > CIDR` precedence without CDN flapping, and prefixes unauthenticated learned names with `~`.
+- **Deep Dissection & Non-Blocking Pipeline:** Producer-consumer capture queue with drop tracking, `packet.time` timestamps, multi-segment TCP `TLS ClientHello` SNI reassembly, RFC 9001 `QUIC Initial` (`UDP 443`) SNI extraction, `CGNAT` (`100.64.0.0/10`) classification, and buffered `.pcap` + `.jsonl` / `.csv` exports.
+- **User Config & Tooling:** Stores config in `%APPDATA%\void_eye` (Windows) or `~/.config/void_eye` (Linux/macOS); ships with `void-eye` CLI entry point, `tools/update_ranges.py`, `ruff`/`mypy` config, and cross-OS GitHub Actions CI.
 
 ```bash
-pip install -r requirements.txt
-
-# Interactive menu (English by default; switch to Arabic/Turkish in menu [3] or via --lang)
-sudo python3 void_eye.py          # Linux / macOS
-python void_eye.py                # Windows (Administrator shell)
-
-# Direct CLI capture
-python void_eye.py --iface eth0 --lang en --filter "port 53 or port 443" --save session.pcap --save session.json
-
-# Run unit tests
-pytest
+pip install -e ".[dev]"
+void-eye --list-interfaces
+sudo void-eye --iface eth0 --max-packets 100 --duration 20 --save out.pcap --save out.jsonl
+pytest -v
 ```
-
-> **Legal & Ethical Notice:** For educational purposes and authorized network diagnostics only. Capture packets strictly on networks you own or are explicitly authorized to test.
 
 ---
 
 ## Türkçe Genel Bakış
 
-**VOID EYE (Mini Wireshark)**, **Python 3.10+** ve **Scapy** ile geliştirilmiş uçbirim (terminal) tabanlı bir ağ paket yakalama ve analiz aracıdır. `IPv4`, `IPv6` ve `ARP` trafiğini gerçek zamanlı izler; `DNS (qname)` ve `TLS SNI` alan adlarını yakalar, arka planda engellemesiz (asenkron) ters DNS çözümlemesi yapar ve oturumları `.pcap`, `.csv` veya `.json` olarak kaydeder.
-
-### Gereksinimler ve Kullanım
-- **Python 3.10+**
-- **Windows:** **[Npcap](https://npcap.com/)** sürücüsünü kurun ve terminali **Yönetici (Administrator)** olarak başlatın.
-- **Linux / macOS:** `sudo` yetkisiyle çalıştırın.
+**VOID EYE (Mini Wireshark)**, **Python 3.10+** ve **Scapy** tabanlı, güvenlik odaklı bir uçbirim paket yakalama aracıdır. Uçbirim kaçış dizisi (ANSI/kontrol karakteri) enjeksiyonunu ve CSV formül enjeksiyonunu engeller; sahte DNS yanıtlarına karşı sorgu eşleştirmesi yapar (`SNI > DNS > rDNS > CIDR`), çok parçalı TCP `TLS ClientHello` ve `QUIC Initial (UDP 443)` SNI alan adlarını çözümler ve oturumları `.pcap`, `.jsonl` veya `.csv` olarak kaydeder.
 
 ```bash
-pip install -r requirements.txt
-python void_eye.py --lang tr
+pip install -e ".[dev]"
+void-eye --list-interfaces
+void-eye --lang tr --max-packets 100 --duration 30
 ```
-
-> **Yasal Uyarı:** Yalnızca eğitim ve yetkili ağ analizi amaçlıdır. Sadece sahibi olduğunuz veya açıkça test izniniz bulunan ağlarda kullanın.

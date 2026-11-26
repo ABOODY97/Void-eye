@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
-
 from typing import TYPE_CHECKING
 
 from i18n import (
@@ -22,11 +21,36 @@ if TYPE_CHECKING:
     from sniffer import CaptureSettings
 
 
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Expected integer, got {raw!r}") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError("Value must be greater than 0")
+    return value
+
+
+def _positive_float(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Expected number, got {raw!r}") from exc
+    if value <= 0.0:
+        raise argparse.ArgumentTypeError("Value must be greater than 0")
+    return value
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     """Create the command-line argument parser."""
     parser = argparse.ArgumentParser(
-        prog="void_eye",
+        prog="void-eye",
         description="VOID EYE - Terminal packet sniffer with smart IP/domain resolution.",
+    )
+    parser.add_argument(
+        "--list-interfaces",
+        action="store_true",
+        help="List active network interfaces with valid IPs and exit.",
     )
     parser.add_argument(
         "--iface",
@@ -50,7 +74,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="PATH",
-        help="Output path (.pcap, .csv, or .json). May be specified multiple times.",
+        help="Output path (.pcap, .csv, or .jsonl). May be specified multiple times.",
+    )
+    parser.add_argument(
+        "--max-packets",
+        type=_positive_int,
+        default=0,
+        metavar="N",
+        help="Stop capture automatically after N matching packets.",
+    )
+    parser.add_argument(
+        "--duration",
+        type=_positive_float,
+        default=0.0,
+        metavar="SECONDS",
+        help="Stop capture automatically after SECONDS elapsed.",
     )
     parser.add_argument(
         "--no-bidi",
@@ -70,16 +108,18 @@ def apply_save_paths(settings: CaptureSettings, raw_paths: list[str]) -> None:
         ext = path.suffix.lower()
         if ext in {".pcap", ".pcapng"}:
             settings.pcap_path = path
-        elif ext in {".csv", ".json"}:
+        elif ext == ".csv":
             settings.log_path = path
+        elif ext in {".jsonl", ".json"}:
+            settings.log_path = path.with_suffix(".jsonl")
         else:
-            # When given a bare stem (e.g. --save capture), enable both .pcap and .csv.
+            # Bare stem (e.g. --save session) enables both .pcap and .jsonl.
             settings.pcap_path = path.with_suffix(".pcap")
-            settings.log_path = path.with_suffix(".csv")
+            settings.log_path = path.with_suffix(".jsonl")
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run VOID EYE via direct CLI capture or interactive main menu."""
+    """Run VOID EYE via CLI flags or interactive main menu."""
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
@@ -92,6 +132,12 @@ def main(argv: list[str] | None = None) -> int:
     bidi_active = False if args.no_bidi else config.bidi_enabled
     set_bidi_enabled(bidi_active)
 
+    if args.list_interfaces:
+        from sniffer import list_interfaces
+
+        ui.print_interfaces_table(list_interfaces(), include_back_option=False)
+        return 0
+
     is_tty = sys.stdin.isatty()
     if not ui.show_legal_notice_once(config, interactive=is_tty and not args.iface):
         print(f"{ui.YELLOW}{t('goodbye')}{ui.RESET}")
@@ -99,7 +145,11 @@ def main(argv: list[str] | None = None) -> int:
 
     from sniffer import CaptureSettings, find_interface, list_interfaces, run_capture
 
-    settings = CaptureSettings(bpf_filter=args.bpf_filter.strip())
+    settings = CaptureSettings(
+        bpf_filter=args.bpf_filter.strip(),
+        max_packets=args.max_packets,
+        duration_limit=args.duration,
+    )
     apply_save_paths(settings, args.save)
 
     resolver = get_resolver()

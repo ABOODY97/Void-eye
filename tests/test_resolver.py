@@ -1,4 +1,4 @@
-"""Unit tests for resolver.py (CIDR matching, domain rules, PSL, private IPs, cache)."""
+"""Unit tests for resolver.py (CIDR, PSL, private/CGNAT IPs, spoofing defense, cache)."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ from resolver import (
     clean_hostname,
     extract_registered_domain,
     load_known_database,
+    sanitize_csv_field,
+    sanitize_network_text,
 )
 
 
@@ -115,7 +117,7 @@ def test_domain_keyword_matching_avoids_substring_false_positives() -> None:
 def test_private_loopback_and_link_local_never_trigger_rdns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Private, loopback, link-local, and multicast IPs get translated labels without calling rDNS."""
+    """Private, CGNAT, loopback, link-local, and multicast IPs get translated labels without rDNS."""
     db_file = tmp_path / "empty.json"
     db_file.write_text("{}", encoding="utf-8")
 
@@ -188,12 +190,197 @@ def test_async_rdns_and_negative_caching(
         # Waiting briefly resolves to cleaned registered domain from cache
         assert resolver.resolve("93.184.216.34", wait_timeout=1.0) == "example.co.uk"
         assert resolver.resolve("93.184.216.34") == "example.co.uk"
+        detailed = resolver.resolve_detailed("93.184.216.34")
+        assert detailed.source == "rdns"
+        assert detailed.display_name == "~example.co.uk"
         assert calls.count("93.184.216.34") == 1
 
         # Failing lookup on a global IP gets negatively cached (not re-queried)
         assert resolver.resolve("93.184.216.99", wait_timeout=1.0) == "93.184.216.99"
         assert resolver.resolve("93.184.216.99") == "93.184.216.99"
         assert calls.count("93.184.216.99") == 1
+        assert resolver.metrics().negative_entries == 1
+    finally:
+        resolver.shutdown()
+
+
+def test_cgnat_range_labeled_distinctly_from_lan(tmp_path: Path) -> None:
+    """RFC 6598 100.64.0.0/10 addresses are labeled CGNAT rather than LAN."""
+    db_file = tmp_path / "empty.json"
+    db_file.write_text("{}", encoding="utf-8")
+    resolver = Resolver(db_path=db_file, enable_async_rdns=False)
+
+    assert resolver.resolve("100.64.0.1") == "100.64.0.1 (CGNAT)"
+    assert resolver.resolve("100.100.100.100") == "100.100.100.100 (CGNAT)"
+    assert resolver.resolve("100.127.255.254") == "100.127.255.254 (CGNAT)"
+    # 100.128.0.1 is outside 100.64.0.0/10 (public global space)
+    assert resolver.resolve("100.128.0.1") == "100.128.0.1"
+
+
+def test_sanitize_network_text_blocks_escape_and_control_sequences() -> None:
+    """ANSI escapes, C0/C1 controls, BiDi overrides, and overlong strings are neutralized."""
+    malicious = "evil\x1b[31m.example\x07\r\n\u202ecom"
+    cleaned = sanitize_network_text(malicious)
+    assert "\x1b" not in cleaned
+    assert "\x07" not in cleaned
+    assert "\r" not in cleaned
+    assert "\n" not in cleaned
+    assert "\u202e" not in cleaned
+    assert cleaned == "evil?[31m.example????com"
+
+    overlong = "a" * 400
+    assert len(sanitize_network_text(overlong)) == 253
+    assert sanitize_network_text(b"sub.\x1b]2;pwn\x07example.org") == "sub.?]2;pwn?example.org"
+
+
+def test_csv_formula_injection_sanitization() -> None:
+    """Spreadsheet formula prefixes (=, +, -, @) are escaped with a leading quote."""
+    assert sanitize_csv_field("=cmd|' /C calc'!A0") == "'=cmd|' /C calc'!A0"
+    assert sanitize_csv_field("+SUM(1,2)") == "'+SUM(1,2)"
+    assert sanitize_csv_field("-2+3") == "'-2+3"
+    assert sanitize_csv_field("@IMPORTXML()") == "'@IMPORTXML()"
+    assert sanitize_csv_field("safe.example.com") == "safe.example.com"
+    assert sanitize_csv_field(443) == 443
+
+
+def test_dns_label_spoofing_protection_and_cdn_sni_priority(tmp_path: Path) -> None:
+    """Unsolicited/mismatched DNS answers are ignored; SNI > DNS > rDNS > CIDR without flapping."""
+    db_file = tmp_path / "cdn.json"
+    db_file.write_text(
+        json.dumps(
+            {
+                "known_ips": {},
+                "known_ranges": {"104.16.0.0/13": "Cloudflare"},
+                "domain_keywords": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    resolver = Resolver(db_path=db_file, enable_async_rdns=False, max_recent_names=3)
+    cdn_ip = "104.16.132.229"
+
+    # Initially matches CIDR (authenticated local DB -> no '~' prefix)
+    res0 = resolver.resolve_detailed(cdn_ip)
+    assert res0.name == "Cloudflare"
+    assert res0.source == "cidr"
+    assert res0.display_name == "Cloudflare"
+
+    # 1. Unsolicited DNS response (no prior outbound query) MUST be rejected
+    accepted = resolver.learn_dns_response(
+        client_ip="192.168.1.10",
+        server_ip="8.8.8.8",
+        txid=0x1234,
+        qname="spoofed.bank.com",
+        mappings=[(cdn_ip, "spoofed.bank.com")],
+    )
+    assert accepted is False
+    assert resolver.resolve(cdn_ip) == "Cloudflare"
+
+    # 2. Record genuine outbound query, then test mismatched TXID & wrong server IP
+    resolver.record_dns_query("192.168.1.10", "8.8.8.8", 0xBEEF, "portal.acme.org")
+    assert (
+        resolver.learn_dns_response(
+            client_ip="192.168.1.10",
+            server_ip="1.1.1.1",  # wrong resolver IP
+            txid=0xBEEF,
+            qname="portal.acme.org",
+            mappings=[(cdn_ip, "portal.acme.org")],
+        )
+        is False
+    )
+    assert (
+        resolver.learn_dns_response(
+            client_ip="192.168.1.10",
+            server_ip="8.8.8.8",
+            txid=0x0001,  # wrong txid
+            qname="portal.acme.org",
+            mappings=[(cdn_ip, "portal.acme.org")],
+        )
+        is False
+    )
+
+    # 3. Matching DNS response succeeds and upgrades CIDR -> DNS (marked '~')
+    assert (
+        resolver.learn_dns_response(
+            client_ip="192.168.1.10",
+            server_ip="8.8.8.8",
+            txid=0xBEEF,
+            qname="portal.acme.org",
+            mappings=[(cdn_ip, "portal.acme.org")],
+        )
+        is True
+    )
+    res_dns = resolver.resolve_detailed(cdn_ip)
+    assert res_dns.name == "acme.org"
+    assert res_dns.source == "dns"
+    assert res_dns.display_name == "~acme.org"
+
+    # Replay of already-consumed TXID is rejected
+    assert (
+        resolver.learn_dns_response(
+            client_ip="192.168.1.10",
+            server_ip="8.8.8.8",
+            txid=0xBEEF,
+            qname="portal.acme.org",
+            mappings=[(cdn_ip, "evil.org")],
+        )
+        is False
+    )
+
+    # 4. TLS SNI arrives -> upgrades to SNI; subsequent DNS for shared CDN IP NEVER overwrites SNI
+    resolver.learn_sni(cdn_ip, "app1.acme.org")
+    assert resolver.resolve_detailed(cdn_ip).name == "app1.acme.org"
+    assert resolver.resolve_detailed(cdn_ip).source == "sni"
+
+    resolver.record_dns_query("192.168.1.10", "8.8.8.8", 0x2222, "other-tenant.io")
+    assert (
+        resolver.learn_dns_response(
+            client_ip="192.168.1.10",
+            server_ip="8.8.8.8",
+            txid=0x2222,
+            qname="other-tenant.io",
+            mappings=[(cdn_ip, "other-tenant.io")],
+        )
+        is True
+    )
+    # Primary name MUST stay the SNI-derived name ("app1.acme.org"), NOT flap to DNS!
+    after_other_dns = resolver.resolve_detailed(cdn_ip)
+    assert after_other_dns.name == "app1.acme.org"
+    assert after_other_dns.source == "sni"
+    assert "other-tenant.io" in after_other_dns.recent_names
+
+    # Newer SNI on the same shared IP updates to the most recent SNI while bounding recent_names
+    resolver.learn_sni(cdn_ip, "app2.acme.org")
+    latest = resolver.resolve_detailed(cdn_ip)
+    assert latest.name == "app2.acme.org"
+    assert latest.source == "sni"
+    assert len(latest.recent_names) <= 3
+
+
+def test_rdns_timeout_prevents_worker_stall(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Slow reverse DNS lookups time out cleanly via Future timeout without hanging workers."""
+    db_file = tmp_path / "empty.json"
+    db_file.write_text("{}", encoding="utf-8")
+
+    def _stalled_rdns(ip: str) -> tuple[str, list[str], list[str]]:
+        time.sleep(2.0)
+        return ("never.reached.example", [], [ip])
+
+    monkeypatch.setattr(socket, "gethostbyaddr", _stalled_rdns)
+    resolver = Resolver(
+        db_path=db_file,
+        rdns_workers=1,
+        rdns_timeout=0.08,
+        enable_async_rdns=True,
+    )
+    try:
+        t0 = time.monotonic()
+        result = resolver.resolve("93.184.216.50", wait_timeout=0.5)
+        elapsed = time.monotonic() - t0
+        assert result == "93.184.216.50"
+        assert elapsed < 0.45
         assert resolver.metrics().negative_entries == 1
     finally:
         resolver.shutdown()

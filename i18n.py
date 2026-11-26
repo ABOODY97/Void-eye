@@ -1,9 +1,10 @@
-"""Internationalization (i18n) and persistent user configuration for VOID EYE."""
+"""Internationalization (i18n) and OS-appropriate user configuration for VOID EYE."""
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
+import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -16,12 +17,32 @@ SUPPORTED_LANGUAGES: dict[str, str] = {
 }
 
 DEFAULT_LANGUAGE = "en"
-CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+APP_DIR_NAME = "void_eye"
+
+
+def get_default_config_path() -> Path:
+    """Return the per-user OS configuration file path.
+
+    - Windows: %APPDATA%\\void_eye\\config.json
+    - Linux/macOS: $XDG_CONFIG_HOME/void_eye/config.json or ~/.config/void_eye/config.json
+    """
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        base_dir = (
+            Path(appdata)
+            if appdata
+            else Path.home() / "AppData" / "Roaming"
+        )
+        return base_dir / APP_DIR_NAME / "config.json"
+
+    xdg_config = os.environ.get("XDG_CONFIG_HOME")
+    base_dir = Path(xdg_config) if xdg_config else Path.home() / ".config"
+    return base_dir / APP_DIR_NAME / "config.json"
 
 
 @dataclass
 class AppConfig:
-    """Persistent user preferences stored in config.json."""
+    """Persistent user preferences stored in the user's config directory."""
 
     language: str = DEFAULT_LANGUAGE
     bidi_enabled: bool = True
@@ -45,7 +66,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "menu_opt_1_label": "Available network interfaces",
         "menu_opt_1_desc": "(select one and start capture)",
         "menu_opt_2_label": "Capture settings",
-        "menu_opt_2_desc": "(BPF filter, protocol filter, save to pcap/CSV)",
+        "menu_opt_2_desc": "(BPF filter, protocol filter, save to pcap/CSV/JSONL)",
         "menu_opt_3_label": "Change language",
         "menu_opt_4_label": "Exit",
         "menu_prompt": "Select an option (1-4): ",
@@ -69,20 +90,21 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ifaces_prompt": "Select interface number (0-{count}): ",
         "iface_selected": "[+] Selected interface: {iface}",
         "iface_not_found": (
-            "[-] Interface '{iface}' was not found. Use option [1] to inspect "
-            "available interfaces."
+            "[-] Interface '{iface}' was not found. Use --list-interfaces or "
+            "option [1] to inspect available interfaces."
         ),
         # Settings menu
         "settings_title": "  Capture Settings",
         "settings_bpf": "BPF Filter",
         "settings_proto": "Protocol Filter",
         "settings_pcap": "Save PCAP File",
-        "settings_log": "Save CSV/JSON Log",
+        "settings_log": "Save CSV/JSONL Log",
         "settings_bidi": "Arabic BiDi Shaping",
         "settings_reset": "Reset settings to defaults",
         "settings_back": "Back to main menu",
         "settings_none": "None",
         "settings_all": "All",
+        "settings_unlimited": "Unlimited",
         "settings_on": "Enabled",
         "settings_off": "Disabled",
         "settings_prompt": "Select setting to modify (0-6): ",
@@ -93,8 +115,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "all, tcp, udp, icmp, dns, arp, ipv6."
         ),
         "prompt_pcap": "Enter .pcap output path (empty to disable): ",
-        "prompt_log": "Enter .csv or .json log path (empty to disable): ",
-        "log_ext_adjusted": "[*] Appended .csv extension -> {path}",
+        "prompt_log": "Enter .csv or .jsonl log path (empty to disable): ",
+        "log_ext_adjusted": "[*] Adjusted log extension -> {path}",
         "settings_updated": "[+] Capture settings updated.",
         "settings_was_reset": "[+] Settings restored to defaults.",
         # Language menu
@@ -107,12 +129,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "[*] VOID EYE capturing on {iface}... (Press Ctrl+C to stop)"
         ),
         "capture_active_filters": "[*] Active filters -> BPF: {bpf} | Protocol: {proto}",
+        "capture_limits": "[*] Limits -> Max packets: {max_pkts} | Duration: {duration}",
         "capture_saving_to": "[*] Recording output -> {targets}",
         "capture_live_stats": "[INFO] Packets: {count} | Traffic: {bytes_str} | {cache}",
         "capture_stopped": "[*] Capture stopped. Returning to main menu...",
         "summary_title": "  Capture Summary",
         "summary_duration": "Duration            : {seconds:.1f}s",
         "summary_packets": "Total Packets       : {packets}",
+        "summary_dropped": "Dropped Packets     : {dropped}",
         "summary_bytes": "Total Bytes         : {bytes_human} ({bytes_raw} B)",
         "summary_protocols": "Protocol Breakdown  :",
         "summary_top_dests": "Top 10 Destinations :",
@@ -122,6 +146,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         # Special IP categories & cache stats
         "ip_localhost": "Localhost",
         "ip_lan": "LAN",
+        "ip_cgnat": "CGNAT",
         "ip_link_local": "Link-Local",
         "ip_multicast": "Multicast",
         "ip_broadcast": "Broadcast",
@@ -145,7 +170,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "menu_opt_1_label": "واجهات الشبكة المتاحة",
         "menu_opt_1_desc": "(اختر واجهة وابدأ الالتقاط)",
         "menu_opt_2_label": "إعدادات الالتقاط",
-        "menu_opt_2_desc": "(فلتر BPF، فلتر البروتوكول، الحفظ إلى pcap/CSV)",
+        "menu_opt_2_desc": "(فلتر BPF، فلتر البروتوكول، الحفظ إلى pcap/CSV/JSONL)",
         "menu_opt_3_label": "تغيير اللغة",
         "menu_opt_4_label": "خروج",
         "menu_prompt": "اختر رقماً من القائمة (1-4): ",
@@ -167,18 +192,19 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "ifaces_back": "[0] العودة إلى القائمة الرئيسية",
         "ifaces_prompt": "اختر رقم الواجهة (0-{count}): ",
         "iface_selected": "[+] تم اختيار الواجهة: {iface}",
-        "iface_not_found": "[-] لم يتم العثور على الواجهة '{iface}'. استخدم الخيار [1] لعرض الواجهات.",
+        "iface_not_found": "[-] لم يتم العثور على الواجهة '{iface}'. استخدم --list-interfaces أو الخيار [1].",
         # Settings menu
         "settings_title": "  إعدادات الالتقاط",
         "settings_bpf": "فلتر BPF",
         "settings_proto": "فلتر البروتوكول",
         "settings_pcap": "حفظ ملف PCAP",
-        "settings_log": "حفظ سجل CSV/JSON",
+        "settings_log": "حفظ سجل CSV/JSONL",
         "settings_bidi": "معالجة النص العربي (BiDi)",
         "settings_reset": "إعادة ضبط الإعدادات للوضع الافتراضي",
         "settings_back": "العودة إلى القائمة الرئيسية",
         "settings_none": "بدون",
         "settings_all": "الكل",
+        "settings_unlimited": "غير محدود",
         "settings_on": "مفعّل",
         "settings_off": "معطّل",
         "settings_prompt": "اختر الإعداد للتعديل (0-6): ",
@@ -186,8 +212,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "prompt_proto": "أدخل البروتوكول (all/tcp/udp/icmp/dns/arp/ipv6): ",
         "invalid_proto": "[-] بروتوكول غير مدعوم '{proto}'. الخيارات: all, tcp, udp, icmp, dns, arp, ipv6.",
         "prompt_pcap": "أدخل مسار ملف .pcap (اتركه فارغاً للتعطيل): ",
-        "prompt_log": "أدخل مسار ملف .csv أو .json (اتركه فارغاً للتعطيل): ",
-        "log_ext_adjusted": "[*] تمت إضافة الامتداد .csv تلقائياً -> {path}",
+        "prompt_log": "أدخل مسار ملف .csv أو .jsonl (اتركه فارغاً للتعطيل): ",
+        "log_ext_adjusted": "[*] تم تعديل امتداد ملف السجل تلقائياً -> {path}",
         "settings_updated": "[+] تم تحديث الإعدادات بنجاح.",
         "settings_was_reset": "[+] تمت استعادة الإعدادات الافتراضية.",
         # Language menu
@@ -198,12 +224,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         # Capture lifecycle & summary
         "capture_starting": "[*] بدأ VOID EYE الالتقاط على {iface}... (اضغط Ctrl+C للإيقاف)",
         "capture_active_filters": "[*] الفلاتر النشطة -> BPF: {bpf} | البروتوكول: {proto}",
+        "capture_limits": "[*] الحدود -> أقصى حزم: {max_pkts} | المدة: {duration}",
         "capture_saving_to": "[*] الحفظ مفعل إلى -> {targets}",
         "capture_live_stats": "[معلومات] الحزم: {count} | الحجم: {bytes_str} | {cache}",
         "capture_stopped": "[*] تم إيقاف الالتقاط. جارٍ العودة للقائمة الرئيسية...",
         "summary_title": "  ملخص جلسة الالتقاط",
         "summary_duration": "المدة الزمنية        : {seconds:.1f} ثانية",
         "summary_packets": "إجمالي الحزم        : {packets}",
+        "summary_dropped": "الحزم المفقودة       : {dropped}",
         "summary_bytes": "إجمالي البيانات     : {bytes_human} ({bytes_raw} بايت)",
         "summary_protocols": "توزيع البروتوكولات   :",
         "summary_top_dests": "أكثر 10 وجهات اتصالاً :",
@@ -213,6 +241,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         # Special IP categories & cache stats
         "ip_localhost": "الجهاز المحلي",
         "ip_lan": "شبكة محلية",
+        "ip_cgnat": "شبكة CGNAT",
         "ip_link_local": "ربط محلي",
         "ip_multicast": "بث متعدد",
         "ip_broadcast": "بث عام",
@@ -238,7 +267,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "menu_opt_1_label": "Kullanılabilir ağ arayüzleri",
         "menu_opt_1_desc": "(birini seçin ve yakalamayı başlatın)",
         "menu_opt_2_label": "Yakalama ayarları",
-        "menu_opt_2_desc": "(BPF filtresi, protokol filtresi, pcap/CSV kaydı)",
+        "menu_opt_2_desc": "(BPF filtresi, protokol filtresi, pcap/CSV/JSONL kaydı)",
         "menu_opt_3_label": "Dili değiştir",
         "menu_opt_4_label": "Çıkış",
         "menu_prompt": "Bir seçenek girin (1-4): ",
@@ -263,19 +292,20 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         "iface_selected": "[+] Seçilen arayüz: {iface}",
         "iface_not_found": (
             "[-] '{iface}' arayüzü bulunamadı. Mevcut arayüzleri görmek için "
-            "[1] seçeneğini kullanın."
+            "--list-interfaces veya [1] seçeneğini kullanın."
         ),
         # Settings menu
         "settings_title": "  Yakalama Ayarları",
         "settings_bpf": "BPF Filtresi",
         "settings_proto": "Protokol Filtresi",
         "settings_pcap": "PCAP Dosyası Kaydet",
-        "settings_log": "CSV/JSON Günlüğü Kaydet",
+        "settings_log": "CSV/JSONL Günlüğü Kaydet",
         "settings_bidi": "Arapça BiDi Şekillendirme",
         "settings_reset": "Ayarları varsayılana sıfırla",
         "settings_back": "Ana menüye dön",
         "settings_none": "Yok",
         "settings_all": "Tümü",
+        "settings_unlimited": "Sınırsız",
         "settings_on": "Etkin",
         "settings_off": "Devre Dışı",
         "settings_prompt": "Değiştirilecek ayarı seçin (0-6): ",
@@ -286,8 +316,8 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "all, tcp, udp, icmp, dns, arp, ipv6."
         ),
         "prompt_pcap": ".pcap dosya yolunu girin (kapatmak için boş bırakın): ",
-        "prompt_log": ".csv veya .json günlük yolunu girin (kapatmak için boş bırakın): ",
-        "log_ext_adjusted": "[*] .csv uzantısı eklendi -> {path}",
+        "prompt_log": ".csv veya .jsonl günlük yolunu girin (kapatmak için boş bırakın): ",
+        "log_ext_adjusted": "[*] Günlük uzantısı ayarlandı -> {path}",
         "settings_updated": "[+] Yakalama ayarları güncellendi.",
         "settings_was_reset": "[+] Ayarlar varsayılana döndürüldü.",
         # Language menu
@@ -300,12 +330,14 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
             "[*] VOID EYE {iface} üzerinde dinliyor... (Durdurmak için Ctrl+C)"
         ),
         "capture_active_filters": "[*] Aktif filtreler -> BPF: {bpf} | Protokol: {proto}",
+        "capture_limits": "[*] Sınırlar -> Maks paket: {max_pkts} | Süre: {duration}",
         "capture_saving_to": "[*] Kayıt hedefleri -> {targets}",
         "capture_live_stats": "[BİLGİ] Paket: {count} | Veri: {bytes_str} | {cache}",
         "capture_stopped": "[*] Yakalama durduruldu. Ana menüye dönülüyor...",
         "summary_title": "  Yakalama Özeti",
         "summary_duration": "Süre                : {seconds:.1f} sn",
         "summary_packets": "Toplam Paket        : {packets}",
+        "summary_dropped": "Düşürülen Paket     : {dropped}",
         "summary_bytes": "Toplam Boyut        : {bytes_human} ({bytes_raw} B)",
         "summary_protocols": "Protokol Dağılımı   :",
         "summary_top_dests": "İlk 10 Hedef        :",
@@ -315,6 +347,7 @@ TRANSLATIONS: dict[str, dict[str, str]] = {
         # Special IP categories & cache stats
         "ip_localhost": "Yerel Makine",
         "ip_lan": "Yerel Ağ",
+        "ip_cgnat": "CGNAT",
         "ip_link_local": "Bağlantı-Yerel",
         "ip_multicast": "Çoklu Yayın",
         "ip_broadcast": "Genel Yayın",
@@ -372,13 +405,12 @@ def t(key: str, **kwargs: Any) -> str:
 
 
 def load_config(path: Path | None = None) -> AppConfig:
-    """Load persistent configuration from disk, returning defaults on failure."""
-    target = path or CONFIG_PATH
+    """Load persistent configuration from user config dir, returning code defaults on failure."""
+    target = path if path is not None else get_default_config_path()
     config = AppConfig()
-    if not target.is_file():
-        return config
-
     try:
+        if not target.is_file():
+            return config
         raw = json.loads(target.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
             lang = raw.get("language")
@@ -397,18 +429,21 @@ def load_config(path: Path | None = None) -> AppConfig:
 
 
 def save_config(config: AppConfig, path: Path | None = None) -> bool:
-    """Persist configuration to disk; return False if writing fails."""
-    target = path or CONFIG_PATH
+    """Persist configuration to user config dir; gracefully return False if unwritable."""
+    target = path if path is not None else get_default_config_path()
     payload = {
         "language": config.language,
         "bidi_enabled": config.bidi_enabled,
         "legal_notice_shown": config.legal_notice_shown,
     }
     try:
-        target.write_text(
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = target.with_suffix(".json.tmp")
+        tmp_path.write_text(
             json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
             encoding="utf-8",
         )
+        tmp_path.replace(target)
         return True
     except OSError:
         return False
