@@ -1,157 +1,143 @@
-import scapy.all as scapy
-from arabic_tools.arabic_tools import fix_ar
-from resolver import resolve, cache_stats
+"""VOID EYE (Mini Wireshark) - CLI entry point and interactive session loop."""
 
-# أكواد الألوان
-GREEN  = '\033[92m'
-BLUE   = '\033[94m'
-YELLOW = '\033[93m'
-CYAN   = '\033[96m'
-RED    = '\033[91m'
-RESET  = '\033[0m'
+from __future__ import annotations
 
-def get_service_name(port: int) -> str:
-    services = {
-        80:   "HTTP",
-        443:  "HTTPS",
-        53:   "DNS",
-        21:   "FTP",
-        22:   "SSH",
-        25:   "SMTP",
-        3306: "MySQL",
-        8080: "HTTP-Alt",
-        6379: "Redis",
-        27017:"MongoDB"
-    }
-    return services.get(port, str(port))
+import argparse
+from pathlib import Path
+import sys
+
+from typing import TYPE_CHECKING
+
+from i18n import (
+    SUPPORTED_LANGUAGES,
+    load_config,
+    set_bidi_enabled,
+    set_language,
+    t,
+)
+from resolver import get_resolver
+import ui
+
+if TYPE_CHECKING:
+    from sniffer import CaptureSettings
 
 
-# ============================
-# عرض كروت الشبكة
-# ============================
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Create the command-line argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="void_eye",
+        description="VOID EYE - Terminal packet sniffer with smart IP/domain resolution.",
+    )
+    parser.add_argument(
+        "--iface",
+        metavar="IFACE",
+        help="Network interface name, index, IP, or GUID to start capturing immediately.",
+    )
+    parser.add_argument(
+        "--lang",
+        choices=tuple(SUPPORTED_LANGUAGES.keys()),
+        help="UI language override (en, ar, tr).",
+    )
+    parser.add_argument(
+        "--filter",
+        dest="bpf_filter",
+        default="",
+        metavar="BPF",
+        help="BPF capture filter expression (e.g. 'tcp port 443').",
+    )
+    parser.add_argument(
+        "--save",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Output path (.pcap, .csv, or .json). May be specified multiple times.",
+    )
+    parser.add_argument(
+        "--no-bidi",
+        action="store_true",
+        help="Disable Arabic reshaping/BiDi reordering for native-RTL terminals.",
+    )
+    return parser
 
-def list_interfaces() -> list[str]:
-    """يجلب قائمة كروت الشبكة المتاحة"""
+
+def apply_save_paths(settings: CaptureSettings, raw_paths: list[str]) -> None:
+    """Populate CaptureSettings output files from --save CLI arguments."""
+    for raw in raw_paths:
+        cleaned = raw.strip()
+        if not cleaned:
+            continue
+        path = Path(cleaned)
+        ext = path.suffix.lower()
+        if ext in {".pcap", ".pcapng"}:
+            settings.pcap_path = path
+        elif ext in {".csv", ".json"}:
+            settings.log_path = path
+        else:
+            # When given a bare stem (e.g. --save capture), enable both .pcap and .csv.
+            settings.pcap_path = path.with_suffix(".pcap")
+            settings.log_path = path.with_suffix(".csv")
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run VOID EYE via direct CLI capture or interactive main menu."""
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    ui.init_colors()
+
+    config = load_config()
+    active_lang = args.lang if args.lang else config.language
+    set_language(active_lang)
+
+    bidi_active = False if args.no_bidi else config.bidi_enabled
+    set_bidi_enabled(bidi_active)
+
+    is_tty = sys.stdin.isatty()
+    if not ui.show_legal_notice_once(config, interactive=is_tty and not args.iface):
+        print(f"{ui.YELLOW}{t('goodbye')}{ui.RESET}")
+        return 0
+
+    from sniffer import CaptureSettings, find_interface, list_interfaces, run_capture
+
+    settings = CaptureSettings(bpf_filter=args.bpf_filter.strip())
+    apply_save_paths(settings, args.save)
+
+    resolver = get_resolver()
+
     try:
-        # scapy يعطينا القاموس كامل
-        ifaces = scapy.get_if_list()
-        return ifaces
-    except Exception:
-        return []
+        # Direct non-menu CLI mode when --iface is supplied
+        if args.iface:
+            interfaces = list_interfaces()
+            target = find_interface(args.iface, interfaces)
+            if target is None:
+                print(f"{ui.RED}{t('iface_not_found', iface=args.iface)}{ui.RESET}")
+                return 1
+            result = run_capture(target, settings, resolver=resolver)
+            return 0 if result is not None else 1
+
+        # Interactive main menu loop
+        while True:
+            choice = ui.prompt_main_menu()
+            if choice is None or choice == 4:
+                print(f"{ui.CYAN}{t('goodbye')}{ui.RESET}")
+                return 0
+
+            if choice == 1:
+                interfaces = list_interfaces()
+                selected = ui.prompt_interface_menu(interfaces)
+                if selected is not None:
+                    run_capture(selected, settings, resolver=resolver)
+                    print(f"{ui.YELLOW}{t('capture_stopped')}{ui.RESET}")
+            elif choice == 2:
+                ui.run_settings_menu(settings, config)
+            elif choice == 3:
+                ui.run_language_menu(config)
+    except KeyboardInterrupt:
+        print(f"\n{ui.CYAN}{t('goodbye')}{ui.RESET}")
+        return 0
+    finally:
+        resolver.shutdown()
 
 
-def select_interface() -> str:
-    """يعرض القائمة ويطلب من المستخدم الاختيار"""
-    ifaces = list_interfaces()
-
-    if not ifaces:
-        print(RED + fix_ar("[-] لم يتم العثور على أي كرت شبكة!") + RESET)
-        exit(1)
-
-    print(CYAN + "=" * 50 + RESET)
-    print(CYAN + fix_ar("  كروت الشبكة المتاحة:") + RESET)
-    print(CYAN + "=" * 50 + RESET)
-
-    for i, iface in enumerate(ifaces, start=1):
-        # نحاول نجيب الـ IP الخاص بكل كرت
-        try:
-            ip = scapy.get_if_addr(iface)
-        except Exception:
-            ip = "N/A"
-
-        # نلوّن الـ IP: أخضر إذا موجود، رمادي إذا ما فيه
-        ip_colored = f"{GREEN}{ip}{RESET}" if ip != "0.0.0.0" else f"\033[90mN/A\033[0m"
-
-        print(f"  {YELLOW}[{i}]{RESET} {BLUE}{iface:<20}{RESET} {ip_colored}")
-
-    print(CYAN + "=" * 50 + RESET)
-
-    while True:
-        try:
-            choice = input(BLUE + fix_ar(f"اختر رقم الكرت (1-{len(ifaces)}): ") + RESET).strip()
-            index = int(choice) - 1
-            if 0 <= index < len(ifaces):
-                selected = ifaces[index]
-                print(GREEN + fix_ar(f"[✓] تم اختيار: {selected}") + RESET)
-                return selected
-            else:
-                print(RED + fix_ar(f"[-] أدخل رقم بين 1 و {len(ifaces)}") + RESET)
-        except ValueError:
-            print(RED + fix_ar("[-] أدخل رقماً صحيحاً فقط!") + RESET)
-
-
-# ============================
-# معالجة الـ Packets
-# ============================
-
-packet_count = 0
-
-def process_packet(packet):
-    global packet_count
-    if packet.haslayer(scapy.IP):
-        packet_count += 1
-
-        src_ip = packet[scapy.IP].src
-        dst_ip = packet[scapy.IP].dst
-
-        src_name = resolve(src_ip)
-        dst_name = resolve(dst_ip)
-
-        proto_name = "Other"
-        details    = ""
-
-        if packet.haslayer(scapy.TCP):
-            proto_name = f"{GREEN}TCP{RESET}"
-            sport  = packet[scapy.TCP].sport
-            dport  = packet[scapy.TCP].dport
-            details = f"| {get_service_name(sport)} -> {get_service_name(dport)}"
-
-        elif packet.haslayer(scapy.UDP):
-            proto_name = f"{CYAN}UDP{RESET}"
-            sport  = packet[scapy.UDP].sport
-            dport  = packet[scapy.UDP].dport
-            details = f"| {get_service_name(sport)} -> {get_service_name(dport)}"
-
-        elif packet.haslayer(scapy.ICMP):
-            proto_name = f"{YELLOW}ICMP{RESET}"
-            details    = f"| Type: {packet[scapy.ICMP].type}"
-
-        print(
-            f"[{proto_name}] "
-            f"{src_name:<28} {YELLOW}>>{RESET} "
-            f"{dst_name:<28} {details}"
-        )
-
-        # كل 100 packet نطبع إحصائيات الـ Cache
-        if packet_count % 100 == 0:
-            print(f"{BLUE}[INFO] Packets: {packet_count} | {cache_stats()}{RESET}")
-
-
-# ============================
-# الشعار
-# ============================
-
-print(CYAN + """
-██╗   ██╗ ██████╗ ██╗██████╗     ███████╗██╗   ██╗███████╗
-██║   ██║██╔═══██╗██║██╔══██╗    ██╔════╝╚██╗ ██╔╝██╔════╝
-██║   ██║██║   ██║██║██║  ██║    █████╗   ╚████╔╝ █████╗
-╚██╗ ██╔╝██║   ██║██║██║  ██║    ██╔══╝    ╚██╔╝  ██╔══╝
- ╚████╔╝ ╚██████╔╝██║██████╔╝    ███████╗   ██║   ███████╗
-  ╚═══╝   ╚═════╝ ╚═╝╚═════╝     ╚══════╝   ╚═╝   ╚══════╝   
-        MINI WIRESHARK - FROM ABOODY                                              
-""" + RESET)
-
-# ============================
-# الاختيار والتشغيل
-# ============================
-
-interface = select_interface()
-print(BLUE + fix_ar(f"[*] VOID EYE بدأ العمل على {interface}... (Ctrl+C للإيقاف)") + RESET)
-print(CYAN + "-" * 60 + RESET)
-
-try:
-    scapy.sniff(iface=interface, store=False, prn=process_packet)
-except KeyboardInterrupt:
-    print(f"\n{RED}" + fix_ar(f"[*] تم الإيقاف | إجمالي الـ Packets: {packet_count} | {cache_stats()}") + RESET)
-except Exception as e:
-    print(RED + fix_ar(f"[-] حدث خطأ: {e}") + RESET)
+if __name__ == "__main__":
+    sys.exit(main())
